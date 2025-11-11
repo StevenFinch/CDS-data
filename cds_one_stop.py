@@ -1,66 +1,71 @@
-#!/usr/bin/env python3
+# cds_one_stop.py
+from __future__ import annotations
 import argparse
 import sys
+import logging
+import pathlib
 import pandas as pd
+
 from cds_helpers.clean_aggregate import build_series
-from cds_helpers.sbsdr_fetch import fetch_sbsdr_day
-from cds_helpers.parsing import find_entity_column, find_tenor_column
 
-def cmd_probe(args):
-    df = fetch_sbsdr_day(args.date)
-    if df.empty:
-        print(f"[probe] No data for {args.date} (holiday or pre-2022-02-14).")
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(prog="cds_one_stop.py")
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    # fetch subcommand
+    pf = sub.add_parser("fetch", help="Download & aggregate ICE SBSR daily CSV into a CDS series")
+    pf.add_argument("--entity", required=True, help='e.g., "United States of America"')
+    pf.add_argument("--tenor-years", type=int, default=5)
+    pf.add_argument("--currency", default="USD")
+    pf.add_argument("--start", required=True)
+    pf.add_argument("--end", required=True)
+    pf.add_argument("--agg", default="weighted_mean", choices=["weighted_mean", "mean"])
+    pf.add_argument("--out", required=True, help="Output CSV path")
+    pf.add_argument("--raw-dir", default="data/raw", help="Where to stash filtered daily files")
+
+    # probe subcommand (optional diagnostic)
+    pp = sub.add_parser("probe", help="Only fetch one day and print column names")
+    pp.add_argument("--date", required=True)
+
+    args, unknown = p.parse_known_args(argv)
+
+    # Backward-compat: if user didn’t provide subcommand but passed flags, assume 'fetch'
+    if args.cmd is None:
+        # Heuristic: the old style started with flags like --entity
+        if argv and any(a.startswith("--entity") for a in argv):
+            return _parse_args(["fetch"] + (argv or []))
+        p.error("argument cmd is required (choose from 'probe', 'fetch')")
+
+    return args
+
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = _parse_args(argv)
+
+    if args.cmd == "probe":
+        from cds_helpers.sbsdr_fetch import fetch_sbsdr_day
+        df = fetch_sbsdr_day(args.date)
+        print(f"Rows: {len(df)}")
+        print(sorted(df.columns))
         return
-    ent_col = find_entity_column(df) or "(not found)"
-    ten_col = find_tenor_column(df) or "(not found)"
-    print(f"[probe] Columns: {len(df.columns)}; entity_col={ent_col}; tenor_col={ten_col}")
-    if ent_col != "(not found)":
-        top = (df[ent_col].astype(str)
-               .value_counts(dropna=True)
-               .head(30))
-        print("\n[probe] Top 30 entity/underlier-like values:")
-        for k, v in top.items():
-            print(f"  {v:5d} × {k}")
-    print("\n[probe] First 5 rows (head):")
-    print(df.head().to_string(index=False))
 
-def cmd_fetch(args):
-    ts = build_series(
-        entity_name=args.entity,
-        start=args.start,
-        end=args.end,
-        currency=args.currency,
-        tenor_prefer=str(args.tenor_years),
-        agg=args.agg,
-    )
-    if ts.empty:
-        print("No data collected in the specified range "
-              "(check: public dissemination starts 2022-02-14; entity label; holiday).")
-        sys.exit(0)
-    out = args.out
-    ts.to_csv(out, index=False)
-    print(f"[ok] wrote {len(ts)} rows -> {out}")
-
-def main():
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    sp = sub.add_parser("probe", help="Inspect a single day to discover columns/entity labels")
-    sp.add_argument("--date", required=True, help="ISO date, e.g., 2024-06-03")
-    sp.set_defaults(func=cmd_probe)
-
-    sf = sub.add_parser("fetch", help="Build a daily series for a range and write CSV")
-    sf.add_argument("--entity", required=True, help='e.g., "United States of America"')
-    sf.add_argument("--tenor-years", type=int, default=5)
-    sf.add_argument("--currency", default="USD")
-    sf.add_argument("--start", required=True)
-    sf.add_argument("--end", required=True)
-    sf.add_argument("--agg", choices=["weighted_mean", "mean"], default="weighted_mean")
-    sf.add_argument("--out", required=True)
-    sf.set_defaults(func=cmd_fetch)
-
-    args = p.parse_args()
-    args.func(args)
+    if args.cmd == "fetch":
+        out = pathlib.Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        ts = build_series(
+            start=args.start,
+            end=args.end,
+            entity=args.entity,
+            tenor_years=args.tenor_years,
+            currency=args.currency,
+            aggregator=args.agg,
+            raw_dir=args.raw_dir,
+        )
+        # Keep even NaN days so you can see gaps; you may dropna later if you want
+        ts.rename(columns={"value": "cds_spread"}, inplace=True)
+        ts.to_csv(out, index=False)
+        logging.info(f"Wrote {out} ({len(ts)} rows; non-null={ts['cds_spread'].notna().sum()})")
+        return
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
