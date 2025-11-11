@@ -1,67 +1,103 @@
-name: Fetch US 5Y CDS (2012–Q3 2024)
+name: Backfill & Update CDS (2012 → 2024Q3)
 
 on:
   workflow_dispatch: {}
-  # optional: refresh weekly (Mon 01:30 UTC)
   schedule:
-    - cron: "30 1 * * 1"
+    - cron: "30 6 * * 1-5"  # 01:30 ET daily, adjust as you prefer
 
 permissions:
   contents: write
 
-concurrency:
-  group: cds-download
-  cancel-in-progress: true
-
 jobs:
-  fetch:
+  backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: System deps for pycurl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Ensure data folder
-        run: mkdir -p data
-
-      - name: Fetch US 5Y CDS time series (2012-01-01 → 2024-09-30)
+      - name: Run yearly slice
+        env:
+          Y: ${{ matrix.year }}
         run: |
-          python cds_one_stop.py fetch \
+          start="${Y}-01-01"
+          end="${Y}-12-31"
+          # cap 2024 at Q3 if needed
+          if [ "$Y" = "2024" ]; then end="2024-09-30"; fi
+
+          python cds_one_stop.py \
             --entity "United States of America" \
             --tenor-years 5 \
             --currency USD \
-            --start 2012-01-01 \
-            --end   2024-09-30 \
+            --start "$start" \
+            --end "$end" \
             --agg weighted_mean \
-            --out data/us_5y_cds_2012_2024Q3.csv
+            --out "data/partial/us_5y_cds_${Y}.csv"
 
-      - name: Commit & push if data changed
-        run: |
-          set -e
-          if git status --porcelain -- data/us_5y_cds_2012_2024Q3.csv | grep -q .; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/us_5y_cds_2012_2024Q3.csv
-            git commit -m "CDS: refresh US 5Y (2012–Q3 2024)"
-            git push
-          else
-            echo "No changes to commit."
-          fi
-
-      - name: Upload artifact
+      - name: Upload partials
         uses: actions/upload-artifact@v4
         with:
-          name: us_5y_cds_2012_2024Q3
-          path: data/us_5y_cds_2012_2024Q3.csv
+          name: cds-partials-${{ matrix.year }}
+          path: data/partial/us_5y_cds_${{ matrix.year }}.csv
+          if-no-files-found: warn
+
+  combine:
+    needs: backfill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: data/partial
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Merge CSVs (stable sort + de-dup)
+        run: |
+          python - <<'PY'
+          import pathlib, pandas as pd
+          p = pathlib.Path("data/partial")
+          files = sorted(p.glob("**/us_5y_cds_*.csv"))
+          if not files:
+              raise SystemExit("No partials found")
+          dfs = []
+          for f in files:
+              try:
+                  df = pd.read_csv(f)
+              except Exception:
+                  continue
+              dfs.append(df)
+          out = pd.concat(dfs, ignore_index=True)
+          out = out.sort_values(["date"]).drop_duplicates(subset=["date"], keep="last")
+          pathlib.Path("data").mkdir(exist_ok=True, parents=True)
+          out.to_csv("data/us_5y_cds.csv", index=False)
+          print("Wrote data/us_5y_cds.csv", len(out))
+          PY
+
+      - name: Commit merged output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/us_5y_cds.csv
+          git commit -m "CDS data: merge partials" || echo "no changes"
+          git push
