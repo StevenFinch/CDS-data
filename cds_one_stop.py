@@ -1,58 +1,65 @@
 #!/usr/bin/env python3
-import argparse, sys, pathlib, datetime as dt
-from dateutil.parser import isoparse
+import argparse
+import sys
+import pandas as pd
 from cds_helpers.clean_aggregate import build_series
-from cds_helpers.sbsdr_fetch import probe_day
-
-def valid_date(s: str) -> dt.date:
-    return isoparse(s).date()
-
-def _common_args(p):
-    p.add_argument("--entity", required=True, help='Reference entity (e.g., "United States of America")')
-    p.add_argument("--tenor-years", type=int, default=5, help="Tenor in years, e.g., 5")
-    p.add_argument("--currency", default="USD", help="Currency, e.g., USD")
-    p.add_argument("--start", type=valid_date, required=True, help="Start date YYYY-MM-DD")
-    p.add_argument("--end", type=valid_date, required=True, help="End date YYYY-MM-DD")
-    p.add_argument("--agg", default="weighted_mean",
-                   choices=["weighted_mean","mean","median","last"],
-                   help="Daily aggregator for multiple prints")
-    p.add_argument("--out", required=True, help="Output CSV path")
-
-def cmd_fetch(args):
-    out = pathlib.Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df = build_series(
-        start=args.start, end=args.end,
-        entity=args.entity, tenor_years=args.tenor_years,
-        currency=args.currency, agg=args.agg
-    )
-    if df.empty:
-        print("No data collected in the specified range (check selectors/date range/entity name).")
-        sys.exit(0)
-    df.to_csv(out, index=False)
-    print(f"Wrote {out} with {len(df)} rows")
+from cds_helpers.sbsdr_fetch import fetch_sbsdr_day
+from cds_helpers.parsing import find_entity_column, find_tenor_column
 
 def cmd_probe(args):
-    ok = probe_day(args.date)
-    print(f"{args.date}: {'available' if ok else 'no file'}")
+    df = fetch_sbsdr_day(args.date)
+    if df.empty:
+        print(f"[probe] No data for {args.date} (holiday or pre-2022-02-14).")
+        return
+    ent_col = find_entity_column(df) or "(not found)"
+    ten_col = find_tenor_column(df) or "(not found)"
+    print(f"[probe] Columns: {len(df.columns)}; entity_col={ent_col}; tenor_col={ten_col}")
+    if ent_col != "(not found)":
+        top = (df[ent_col].astype(str)
+               .value_counts(dropna=True)
+               .head(30))
+        print("\n[probe] Top 30 entity/underlier-like values:")
+        for k, v in top.items():
+            print(f"  {v:5d} × {k}")
+    print("\n[probe] First 5 rows (head):")
+    print(df.head().to_string(index=False))
+
+def cmd_fetch(args):
+    ts = build_series(
+        entity_name=args.entity,
+        start=args.start,
+        end=args.end,
+        currency=args.currency,
+        tenor_prefer=str(args.tenor_years),
+        agg=args.agg,
+    )
+    if ts.empty:
+        print("No data collected in the specified range "
+              "(check: public dissemination starts 2022-02-14; entity label; holiday).")
+        sys.exit(0)
+    out = args.out
+    ts.to_csv(out, index=False)
+    print(f"[ok] wrote {len(ts)} rows -> {out}")
 
 def main():
-    # Support old "no-subcommand" call by redirecting to fetch if first token isn't a known verb
-    if len(sys.argv) > 1 and sys.argv[1] not in {"fetch","probe","-h","--help"}:
-        sys.argv.insert(1, "fetch")
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
 
-    ap = argparse.ArgumentParser()
-    sp = ap.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("probe", help="Inspect a single day to discover columns/entity labels")
+    sp.add_argument("--date", required=True, help="ISO date, e.g., 2024-06-03")
+    sp.set_defaults(func=cmd_probe)
 
-    p_fetch = sp.add_parser("fetch", help="Fetch & aggregate CDS")
-    _common_args(p_fetch)
-    p_fetch.set_defaults(func=cmd_fetch)
+    sf = sub.add_parser("fetch", help="Build a daily series for a range and write CSV")
+    sf.add_argument("--entity", required=True, help='e.g., "United States of America"')
+    sf.add_argument("--tenor-years", type=int, default=5)
+    sf.add_argument("--currency", default="USD")
+    sf.add_argument("--start", required=True)
+    sf.add_argument("--end", required=True)
+    sf.add_argument("--agg", choices=["weighted_mean", "mean"], default="weighted_mean")
+    sf.add_argument("--out", required=True)
+    sf.set_defaults(func=cmd_fetch)
 
-    p_probe = sp.add_parser("probe", help="Check ICE SBSDR availability for a day")
-    p_probe.add_argument("--date", type=valid_date, required=True, help="YYYY-MM-DD")
-    p_probe.set_defaults(func=cmd_probe)
-
-    args = ap.parse_args()
+    args = p.parse_args()
     args.func(args)
 
 if __name__ == "__main__":
