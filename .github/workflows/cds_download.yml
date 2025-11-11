@@ -1,57 +1,42 @@
-name: Build CDS (ICE SBSR 2012–Q3 2024)
+name: Fetch CDS (SBSR)
 
 on:
   workflow_dispatch: {}
   schedule:
-    # Weekly Monday 08:10 UTC to avoid rate spikes
-    - cron: "10 8 * * 1"
+    - cron: "30 11 * * 2"  # Tue 06:30 ET (avoid peak hours)
 
 permissions:
   contents: write
 
-concurrency:
-  group: cds-build
-  cancel-in-progress: true
-
 jobs:
-  build:
+  fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Make folders
+      - name: Probe coverage
         run: |
-          mkdir -p data/partial data/raw
+          python cds_one_stop.py probe
 
-      - name: Fetch yearly slices (2012–2024Q3)
+      - name: Yearly pulls (2012 → 2024Q3) with SBSR clipping
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p data/partial
           for Y in $(seq 2012 2024); do
             start="${Y}-01-01"
             end="${Y}-12-31"
             if [ "$Y" = "2024" ]; then end="2024-09-30"; fi
-
-            echo "::group::Fetch $Y ($start..$end)"
+            echo "== Year $Y =="
             python cds_one_stop.py fetch \
               --entity "United States of America" \
               --tenor-years 5 \
@@ -59,41 +44,29 @@ jobs:
               --start "$start" \
               --end "$end" \
               --agg weighted_mean \
-              --out "data/partial/us_5y_cds_${Y}.csv" \
-              --raw-dir "data/raw"
-            echo "::endgroup::"
+              --out "data/partial/us_5y_cds_${Y}.csv"
           done
 
-      - name: Merge slices -> data/us_5y_cds.csv
+      - name: Merge partials
         shell: python
         run: |
           import pathlib, pandas as pd, glob
           files = sorted(glob.glob("data/partial/us_5y_cds_*.csv"))
           if not files:
-              raise SystemExit("No partials found — earlier step may have failed.")
-          dfs = []
-          for f in files:
-              try:
-                  df = pd.read_csv(f)
-              except Exception:
-                  continue
-              dfs.append(df)
+              raise SystemExit("No partials were written")
+          dfs = [pd.read_csv(f) for f in files]
           all_ = pd.concat(dfs, ignore_index=True)
-          all_["date"] = pd.to_datetime(all_["date"]).dt.date
-          all_ = all_.sort_values("date")
-          # Keep last if duplicates; don't drop NaN because gaps are informative
+          all_["date"] = pd.to_datetime(all_["date"], errors="coerce").dt.date
+          all_ = all_.dropna(subset=["date"]).sort_values("date")
           all_ = all_.drop_duplicates(subset=["date"], keep="last")
-          out = pathlib.Path("data/us_5y_cds.csv")
-          out.parent.mkdir(parents=True, exist_ok=True)
-          all_.to_csv(out, index=False)
-          print("Wrote", out, "rows=", len(all_), "non_null=", all_["cds_spread"].notna().sum())
+          pathlib.Path("data").mkdir(parents=True, exist_ok=True)
+          all_.to_csv("data/us_5y_cds.csv", index=False)
+          print("Wrote data/us_5y_cds.csv", len(all_), "rows")
 
-      - name: Commit & push
-        if: ${{ github.event_name != 'pull_request' }}
-        run: |
-          set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data
-          git commit -m "CDS build: ICE SBSR 2012–Q3 2024" || { echo "Nothing to commit"; exit 0; }
-          git push
+      - name: Commit dataset
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "data: update us_5y_cds (SBSR clipped to 2021-11-08+)"
+          file_pattern: |
+            data/us_5y_cds.csv
+            data/partial/*.csv
