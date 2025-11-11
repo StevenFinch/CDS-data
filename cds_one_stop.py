@@ -1,71 +1,64 @@
 # cds_one_stop.py
 from __future__ import annotations
 import argparse
-import sys
 import logging
-import pathlib
+import sys
+from datetime import date, datetime
+
 import pandas as pd
+from cds_helpers.clean_aggregate import build_series, _MIN_SBSR_DATE
 
-from cds_helpers.clean_aggregate import build_series
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-def _parse_args(argv=None):
+def _parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def cmd_probe(args: argparse.Namespace) -> None:
+    print("SBSR coverage notice:")
+    print(f"  - Security-based swaps public dissemination (SBSR) began on {_MIN_SBSR_DATE}.")
+    print("  - If you request dates prior to that, the series will return NaNs for those days.")
+    print("Entities & selectors are heuristic; inspect 'data/debug' if you get unexpected empties.")
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    start = _parse_date(args.start)
+    end = _parse_date(args.end)
+
+    ser = build_series(
+        start=start,
+        end=end,
+        entity=args.entity,
+        tenor_years=args.tenor_years,
+        currency=args.currency,
+        agg=args.agg,
+        min_start=_MIN_SBSR_DATE,  # clip to SBSR go-live
+    )
+    out = args.out
+    ser.rename(columns={"value_bps": "cds_5y_bps"}, inplace=True)
+    ser.to_csv(out, index=False)
+    logging.info("Wrote %s (%d rows, %d non-NaN)", out, len(ser), ser["cds_5y_bps"].notna().sum())
+
+def main(argv: list[str]) -> None:
     p = argparse.ArgumentParser(prog="cds_one_stop.py")
-    sub = p.add_subparsers(dest="cmd", required=False)
+    sub = p.add_subparsers(dest="cmd", required=True)
 
-    # fetch subcommand
-    pf = sub.add_parser("fetch", help="Download & aggregate ICE SBSR daily CSV into a CDS series")
-    pf.add_argument("--entity", required=True, help='e.g., "United States of America"')
-    pf.add_argument("--tenor-years", type=int, default=5)
-    pf.add_argument("--currency", default="USD")
-    pf.add_argument("--start", required=True)
-    pf.add_argument("--end", required=True)
-    pf.add_argument("--agg", default="weighted_mean", choices=["weighted_mean", "mean"])
-    pf.add_argument("--out", required=True, help="Output CSV path")
-    pf.add_argument("--raw-dir", default="data/raw", help="Where to stash filtered daily files")
+    pr = sub.add_parser("probe", help="Explain data coverage & selectors")
+    pr.set_defaults(func=cmd_probe)
 
-    # probe subcommand (optional diagnostic)
-    pp = sub.add_parser("probe", help="Only fetch one day and print column names")
-    pp.add_argument("--date", required=True)
+    f = sub.add_parser("fetch", help="Fetch & aggregate CDS series")
+    f.add_argument("--entity", required=True, help='e.g., "United States of America"')
+    f.add_argument("--tenor-years", type=int, default=5)
+    f.add_argument("--currency", default="USD")
+    f.add_argument("--start", required=True)
+    f.add_argument("--end", required=True)
+    f.add_argument("--agg", choices=["weighted_mean", "mean"], default="weighted_mean")
+    f.add_argument("--out", required=True)
+    f.set_defaults(func=cmd_fetch)
 
-    args, unknown = p.parse_known_args(argv)
-
-    # Backward-compat: if user didn’t provide subcommand but passed flags, assume 'fetch'
-    if args.cmd is None:
-        # Heuristic: the old style started with flags like --entity
-        if argv and any(a.startswith("--entity") for a in argv):
-            return _parse_args(["fetch"] + (argv or []))
-        p.error("argument cmd is required (choose from 'probe', 'fetch')")
-
-    return args
-
-def main(argv=None):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    args = _parse_args(argv)
-
-    if args.cmd == "probe":
-        from cds_helpers.sbsdr_fetch import fetch_sbsdr_day
-        df = fetch_sbsdr_day(args.date)
-        print(f"Rows: {len(df)}")
-        print(sorted(df.columns))
-        return
-
-    if args.cmd == "fetch":
-        out = pathlib.Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        ts = build_series(
-            start=args.start,
-            end=args.end,
-            entity=args.entity,
-            tenor_years=args.tenor_years,
-            currency=args.currency,
-            aggregator=args.agg,
-            raw_dir=args.raw_dir,
-        )
-        # Keep even NaN days so you can see gaps; you may dropna later if you want
-        ts.rename(columns={"value": "cds_spread"}, inplace=True)
-        ts.to_csv(out, index=False)
-        logging.info(f"Wrote {out} ({len(ts)} rows; non-null={ts['cds_spread'].notna().sum()})")
-        return
+    args = p.parse_args(argv)
+    args.func(args)
 
 if __name__ == "__main__":
     main(sys.argv[1:])
