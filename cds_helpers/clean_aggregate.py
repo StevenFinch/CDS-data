@@ -1,181 +1,150 @@
 # cds_helpers/clean_aggregate.py
 from __future__ import annotations
+
 import logging
-from datetime import date, timedelta
-from typing import Iterable, Optional, Tuple
-
-import numpy as np
+from typing import Iterable, Optional, Literal, Dict, Any, List
 import pandas as pd
+from .sbsdr_fetch import fetch_sbsdr_day
 
-from .sbsdr_fetch import fetch_sbsdr_day, FetchFailed
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
 
-log = logging.getLogger(__name__)
+# column alias maps (lowercased)
+REF_ENTITY_KEYS = [
+    "referenceentity", "reference_entity", "referenceentityname",
+    "entity", "name", "underlier", "underlyingreference", "underlying_name",
+    "sbse_reference_entity_name", "reference_index_underlier"
+]
+CCY_KEYS = ["currency", "settlementcurrency", "notionalcurrency", "ccy"]
+TENOR_KEYS = ["tenor", "maturitytenor", "quotedtenor"]
+SPREAD_KEYS = ["parspread", "par_spread", "quotedspread", "spread", "price"]
 
-_MIN_SBSR_DATE = pd.Timestamp("2021-11-08").date()  # SEC SBSR go-live
+def _lc_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    # preserve original, but we will search case-insensitively
+    return df
 
-def _norm(s: Optional[str]) -> str:
-    return (s or "").strip().lower()
-
-def _pick_first(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
-    for n in names:
-        if n in df.columns:
-            return n
+def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {c.lower(): c for c in df.columns}
+    for k in candidates:
+        if k in cols:
+            return cols[k]
+    # fallback: try startswith for messy header variants
+    for c in df.columns:
+        lc = c.lower()
+        if any(lc.startswith(k) for k in candidates):
+            return c
     return None
 
-def _infer_spread_bps(df: pd.DataFrame) -> pd.Series:
-    """
-    Try a few column names that appear in SBS tapes for CDS price/spread.
-    Returns a float series in basis points when feasible; NaN if absent/unusable.
-    """
-    cand_cols = [
-        "quotedspreadsibi", "quotedspread", "cdsspread", "spreadbps", "spread", "price"
-    ]
-    col = _pick_first(df, cand_cols)
-    if not col:
-        return pd.Series(np.nan, index=df.index, dtype="float64")
+def _to_bps(v: pd.Series) -> pd.Series:
+    # If typical magnitudes look like 50–300 => bps already
+    # If typical magnitudes < 3 => probably decimal (0.0123 => 123 bps)
+    s = pd.to_numeric(v, errors="coerce")
+    if s.dropna().empty:
+        return s
+    med = s.dropna().abs().median()
+    if pd.isna(med):
+        return s
+    if med < 3:  # decimal
+        return s * 1_00 * 100  # 1.00% == 100 bps; decimal(0.01) -> 100 bps
+    return s
 
-    x = pd.to_numeric(df[col], errors="coerce")
-
-    # Heuristic: valid CDS spreads are usually between 0 and 5000 bps.
-    # Some tapes put decimals (like 125.5 = 125.5 bps) — both cases are fine.
-    x = x.where((x >= 0) & (x <= 5000))
-    return x
-
-def _infer_notional(df: pd.DataFrame) -> pd.Series:
-    cand = _pick_first(df, ["reportednotional", "notionalamount", "notional", "transactionnotional"])
-    if not cand:
-        return pd.Series(np.nan, index=df.index, dtype="float64")
-    return pd.to_numeric(df[cand], errors="coerce")
-
-def _has_tenor_approx(df: pd.DataFrame, target_years: int) -> pd.Series:
-    # Direct tenor columns first
-    for cname in ["tenor", "producttenor", "maturitybucket", "cdstenorbucket"]:
-        if cname in df.columns:
-            t = df[cname].astype(str).str.upper().str.strip()
-            return t.eq(f"{target_years}Y") | t.eq(f"{target_years}YR") | t.eq(f"{target_years}-YEAR")
-    # Fallback: infer by termination - effective date (when provided)
-    eff = _pick_first(df, ["effectivedate", "startdate"])
-    end = _pick_first(df, ["terminationdate", "enddate", "maturitydate"])
-    if eff and end:
-        try:
-            t_eff = pd.to_datetime(df[eff], errors="coerce")
-            t_end = pd.to_datetime(df[end], errors="coerce")
-            years = (t_end - t_eff).dt.days / 365.25
-            return (years >= target_years - 0.75) & (years <= target_years + 0.75)
-        except Exception:  # noqa: BLE001
-            pass
-    # If we can't tell, don't filter them out (return all True to avoid false negatives)
-    return pd.Series(True, index=df.index)
-
-def _in_currency(df: pd.DataFrame, cur: str) -> pd.Series:
-    cur = _norm(cur)
-    for cname in ["reportedcurrency", "notionalcurrency", "pricecurrency", "currency"]:
-        if cname in df.columns:
-            cand = df[cname].astype(str).str.lower().str.strip()
-            return cand.eq(cur)
-    # If unknown, don't over-filter
-    return pd.Series(True, index=df.index)
-
-def _entity_match(df: pd.DataFrame, entity: str) -> pd.Series:
-    """
-    Try to match reference entity across a few name-ish columns.
-    """
-    entity_l = _norm(entity)
-    cols = [c for c in df.columns if any(k in c.lower() for k in
-            ["reference", "entity", "issuer", "name", "underlier", "underlying", "security"])]
-    if not cols:
-        # permissive: search across all string columns concatenated
-        blocks = df.apply(lambda r: " ".join([str(v) for v in r.values]), axis=1).str.lower()
-        return blocks.str.contains(entity_l, na=False)
-    blob = df[cols].astype(str).agg(" ".join, axis=1).str.lower()
-    return blob.str.contains(entity_l, na=False)
+def _match_entity(text: str, entity_tokens: List[str]) -> bool:
+    t = (text or "").lower()
+    return all(tok in t for tok in entity_tokens)
 
 def build_series(
-    start: date,
-    end: date,
+    start_date: str,
+    end_date: str,
     entity: str,
-    tenor_years: int,
-    currency: str,
-    agg: str = "weighted_mean",
-    min_start: Optional[date] = _MIN_SBSR_DATE,
+    tenor_years: int = 5,
+    currency: Optional[str] = "USD",
+    aggregation: Literal["weighted_mean","median","mean"] = "weighted_mean",
 ) -> pd.DataFrame:
     """
-    Build a daily series of CDS spreads (bps) for [entity, tenor, currency].
-    If start < min_start (SBSR go-live), we clip and log a note.
-    Ensures we *always* return rows for each calendar day with 'date' present.
+    Iterate days, fetch SBSR CSV, filter to CDS rows matching entity/tenor/currency,
+    aggregate to daily par-spread (bps). Returns DataFrame[date, par_spread_bps, n_trades].
     """
-    # clip to SBSR coverage if requested
-    clipped_start = start
-    if min_start and start < min_start:
-        clipped_start = min_start
-        log.warning(
-            "Start date %s predates SBSR public dissemination (min %s). "
-            "Dates before this will be returned as NaN.",
-            start, min_start,
-        )
+    dates = pd.date_range(start=start_date, end=end_date, freq="D")
+    rows: List[Dict[str, Any]] = []
+    entity_tokens = [w for w in entity.lower().replace(".", "").split() if w]
 
-    days = pd.date_range(start, end, freq="D").date
-    out_rows = []
-
-    for d in days:
-        # Pre-SBSR days: return explicit NaN row (so we never get empty frames)
-        if min_start and d < clipped_start:
-            out_rows.append({"date": d, "value_bps": np.nan, "count": 0, "notional_sum": 0.0})
+    for day in dates:
+        ds = day.strftime("%Y-%m-%d")
+        df = fetch_sbsdr_day(ds, raw_dir="data/raw")
+        if df is None or df.empty:
             continue
 
-        d_str = d.isoformat()
-        log.info("[SBSR] Fetch %s", d_str)
-        try:
-            raw = fetch_sbsdr_day(d_str)
-        except FetchFailed as e:
-            log.warning("%s: fetch error: %s", d_str, e)
-            out_rows.append({"date": d, "value_bps": np.nan, "count": 0, "notional_sum": 0.0})
+        df = _lc_columns(df)
+
+        # Basic filters: asset class & product
+        asset_col = _find_col(df, ["assetclass"])
+        prod_col  = _find_col(df, ["product", "producttype"])
+        if asset_col:
+            df = df[df[asset_col].astype(str).str.lower().str.contains("credit", na=False)]
+        if prod_col:
+            df = df[df[prod_col].astype(str).str.lower().str.contains("cds|credit default", na=False)]
+
+        if df.empty:
             continue
 
-        if raw is None or raw.empty:
-            out_rows.append({"date": d, "value_bps": np.nan, "count": 0, "notional_sum": 0.0})
+        # Reference entity filter
+        ref_col = _find_col(df, REF_ENTITY_KEYS)
+        if ref_col:
+            df = df[df[ref_col].astype(str).apply(lambda x: _match_entity(x, entity_tokens))]
+        # Currency filter
+        if currency:
+            ccy_col = _find_col(df, CCY_KEYS)
+            if ccy_col:
+                df = df[df[ccy_col].astype(str).str.upper() == currency.upper()]
+
+        # Tenor filter (keep lightly, many feeds call it '5Y', '5y', 'P5Y')
+        ten_col = _find_col(df, TENOR_KEYS)
+        if ten_col:
+            df = df[df[ten_col].astype(str).str.contains("5", case=False, na=False)]
+
+        if df.empty:
             continue
 
-        # Normalize columns to lowercase
-        raw.columns = [c.strip().lower() for c in raw.columns]
-
-        # Keep only likely CDS
-        # If an 'assetclass' or 'product' column is present, prefer "CD" or "CDS"
-        if "assetclass" in raw.columns:
-            mask_asset = raw["assetclass"].astype(str).str.upper().str.startswith("CD")
-            raw = raw[mask_asset]
-
-        # Entity / tenor / currency filters (permissive if fields missing)
-        mask_ent = _entity_match(raw, entity)
-        mask_ten = _has_tenor_approx(raw, tenor_years)
-        mask_cur = _in_currency(raw, currency)
-        sub = raw[mask_ent & mask_ten & mask_cur].copy()
-
-        if sub.empty:
-            out_rows.append({"date": d, "value_bps": np.nan, "count": 0, "notional_sum": 0.0})
+        # Spread field
+        sp_col = _find_col(df, SPREAD_KEYS)
+        if not sp_col:
+            # No quoted spread; skip this day politely
+            LOG.info("No spread column on %s; kept raw, skipping aggregation", ds)
             continue
 
-        sub["spread_bps"] = _infer_spread_bps(sub)
-        sub["w_notional"] = _infer_notional(sub).fillna(0.0)
+        # Try weights (by notional if present)
+        w_col = _find_col(df, ["notionalamount", "notional", "quantity"])
+        weights = None
+        if w_col:
+            weights = pd.to_numeric(df[w_col], errors="coerce")
 
-        sub = sub.dropna(subset=["spread_bps"])
-        if sub.empty:
-            out_rows.append({"date": d, "value_bps": np.nan, "count": 0, "notional_sum": float(sub["w_notional"].sum() if "w_notional" in sub else 0.0)})
-            continue
+        spreads = _to_bps(df[sp_col])
 
-        count = len(sub)
-        notional_sum = float(sub["w_notional"].sum()) if "w_notional" in sub else float(count)
-
-        if agg == "weighted_mean" and "w_notional" in sub and sub["w_notional"].sum() > 0:
-            value = float(np.average(sub["spread_bps"], weights=sub["w_notional"]))
+        # Build daily aggregate
+        day_spread = None
+        if aggregation == "weighted_mean" and w_col and weights.notna().any():
+            try:
+                day_spread = (spreads * weights).sum() / weights.sum()
+            except Exception:
+                day_spread = spreads.mean()
+        elif aggregation == "median":
+            day_spread = spreads.median()
         else:
-            value = float(sub["spread_bps"].mean())
+            day_spread = spreads.mean()
 
-        out_rows.append(
-            {"date": d, "value_bps": value, "count": int(count), "notional_sum": notional_sum}
-        )
+        if pd.isna(day_spread):
+            continue
 
-    ser = pd.DataFrame(out_rows)
-    ser["date"] = pd.to_datetime(ser["date"]).dt.date
-    ser = ser.sort_values("date").reset_index(drop=True)
-    return ser
+        rows.append({"date": ds, "par_spread_bps": float(day_spread), "n_trades": int(len(df))})
+
+    # Return tidy frame; if empty, return schema to avoid KeyError
+    if not rows:
+        LOG.warning("No data collected between %s and %s for entity=%s", start_date, end_date, entity)
+        return pd.DataFrame(columns=["date", "par_spread_bps", "n_trades"])
+
+    out = pd.DataFrame(rows)
+    out["date"] = pd.to_datetime(out["date"]).dt.date
+    out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    return out
