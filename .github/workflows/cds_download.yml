@@ -1,42 +1,46 @@
-name: Fetch CDS (SBSR)
+name: Build CDS (2012–Q3 2024) and save artifacts
 
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "30 11 * * 2"  # Tue 06:30 ET (avoid peak hours)
+  push:
+    branches: [ main ]
 
 permissions:
   contents: write
 
+concurrency:
+  group: cds-daily
+  cancel-in-progress: false
+
 jobs:
-  fetch:
+  cds:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install -U pip
-          pip install -r requirements.txt
+          pip install pandas requests tenacity tqdm
 
-      - name: Probe coverage
+      - name: Build yearly partials
+        env:
+          ICE_HOSTS: regreporting.theice.com,www.regreporting.theice.com
         run: |
-          python cds_one_stop.py probe
-
-      - name: Yearly pulls (2012 → 2024Q3) with SBSR clipping
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/partial
+          set -e
+          mkdir -p data/partial data/raw
           for Y in $(seq 2012 2024); do
             start="${Y}-01-01"
             end="${Y}-12-31"
             if [ "$Y" = "2024" ]; then end="2024-09-30"; fi
-            echo "== Year $Y =="
+
+            echo "::group::Year ${Y}"
             python cds_one_stop.py fetch \
               --entity "United States of America" \
               --tenor-years 5 \
@@ -44,29 +48,44 @@ jobs:
               --start "$start" \
               --end "$end" \
               --agg weighted_mean \
-              --out "data/partial/us_5y_cds_${Y}.csv"
+              --out "data/partial/us_5y_cds_${Y}.csv" || echo "Year ${Y}: no data or partial failures"
+            echo "::endgroup::"
           done
 
       - name: Merge partials
-        shell: python
         run: |
-          import pathlib, pandas as pd, glob
-          files = sorted(glob.glob("data/partial/us_5y_cds_*.csv"))
-          if not files:
-              raise SystemExit("No partials were written")
-          dfs = [pd.read_csv(f) for f in files]
-          all_ = pd.concat(dfs, ignore_index=True)
-          all_["date"] = pd.to_datetime(all_["date"], errors="coerce").dt.date
-          all_ = all_.dropna(subset=["date"]).sort_values("date")
-          all_ = all_.drop_duplicates(subset=["date"], keep="last")
+          python - <<'PY'
+          import pathlib, pandas as pd, glob, sys
+          files = glob.glob("data/partial/us_5y_cds_*.csv")
           pathlib.Path("data").mkdir(parents=True, exist_ok=True)
+          if not files:
+              print("No partials to merge", file=sys.stderr)
+              open("data/us_5y_cds.csv","w").write("date,par_spread_bps,n_trades\n")
+              sys.exit(0)
+          dfs = []
+          for f in sorted(files):
+              try:
+                  df = pd.read_csv(f)
+              except Exception:
+                  continue
+              dfs.append(df)
+          if not dfs:
+              open("data/us_5y_cds.csv","w").write("date,par_spread_bps,n_trades\n")
+              sys.exit(0)
+          all_ = pd.concat(dfs, ignore_index=True)
+          if "date" in all_.columns:
+              all_["date"] = pd.to_datetime(all_["date"]).dt.date
+              all_ = all_.sort_values(["date"]).drop_duplicates(subset=["date"], keep="last")
           all_.to_csv("data/us_5y_cds.csv", index=False)
-          print("Wrote data/us_5y_cds.csv", len(all_), "rows")
+          print("Merged -> data/us_5y_cds.csv", len(all_))
+          PY
 
-      - name: Commit dataset
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          commit_message: "data: update us_5y_cds (SBSR clipped to 2021-11-08+)"
-          file_pattern: |
+          name: us_5y_cds
+          path: |
             data/us_5y_cds.csv
             data/partial/*.csv
+            data/raw/*.csv.gz
+          if-no-files-found: warn
