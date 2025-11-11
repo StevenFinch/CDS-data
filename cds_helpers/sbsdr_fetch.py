@@ -1,59 +1,49 @@
+# cds_helpers/sbsdr_fetch.py
+from __future__ import annotations
 import io
-import time
-import typing as t
+import logging
+from typing import Optional
 import pandas as pd
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-CSV_PATH = "/trade-reporting/api/v1/public-data/sbs-transaction-csv?tradeDate={date}"
-HOSTS = [
-    "https://regreporting.theice.com",  # primary
-    # Fallback host kept for resilience; if it 404s, we just try next.
-    "https://icetradevault.com",
-]
+BASE = "https://regreporting.theice.com/trade-reporting/api/v1/public-data/sbs-transaction-csv"
 
-class FetchError(Exception):
+class FetchError(RuntimeError):
     pass
 
 @retry(
-    retry=retry_if_exception_type((requests.RequestException, FetchError)),
-    wait=wait_exponential(multiplier=1, min=1, max=20),
     stop=stop_after_attempt(5),
-    reraise=True
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    retry=retry_if_exception_type((requests.exceptions.RequestException,))
 )
-def _get_csv_text(url: str, timeout: int = 30) -> str:
-    resp = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (ICE-SBSDR-CDS-fetch/1.0)"},
-        timeout=timeout,
-    )
+def _get_csv(trade_date: str) -> Optional[pd.DataFrame]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (research; cds-aggregator)",
+        "Accept": "text/csv, */*;q=0.1",
+    }
+    url = f"{BASE}?tradeDate={trade_date}"
+    resp = requests.get(url, timeout=30, headers=headers)
     if resp.status_code == 404:
-        raise FetchError(f"404 at {url}")
+        # Some days truly absent
+        return None
     resp.raise_for_status()
-    text = resp.text
-    # crude sanity: must look like CSV header (contain comma and some known tokens)
-    if "," not in text or len(text) < 50:
-        raise FetchError("Response doesn't look like CSV")
-    return text
+    if not resp.text.strip():
+        return None
+    try:
+        return pd.read_csv(io.StringIO(resp.text))
+    except Exception as e:
+        raise FetchError(f"CSV parse failed for {trade_date}: {e}") from e
 
-def fetch_sbsdr_day(date_str: str) -> pd.DataFrame:
+def fetch_sbsdr_day(trade_date: str) -> pd.DataFrame:
     """
-    Returns a pandas DataFrame of *all* SBSDR prints on a given date.
-    If nothing available (holiday/early dates), returns empty DataFrame.
+    Returns DataFrame (possibly empty) of SBS transactions for the given date.
     """
-    last_err = None
-    for host in HOSTS:
-        url = f"{host}{CSV_PATH.format(date=date_str)}"
-        try:
-            csv_text = _get_csv_text(url)
-            df = pd.read_csv(io.StringIO(csv_text))
-            # Normalize columns for downstream logic
-            df.columns = [c.strip() for c in df.columns]
-            return df
-        except Exception as e:
-            last_err = e
-            time.sleep(0.5)
-            continue
-    # If all hosts fail, return empty but informative (caller will handle)
-    return pd.DataFrame()
-
+    logging.info(f"[SBSR] Fetch {trade_date}")
+    df = _get_csv(trade_date)
+    if df is None:
+        logging.info(f"[SBSR] {trade_date}: no rows")
+        return pd.DataFrame()
+    # Normalize columns to lower snake for easier downstream handling
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    return df
