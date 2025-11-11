@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.log
+
+# Virtual envs
+.env
+.venv
+env/
+venv/
+auction_env/
+*.sqlite
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Playwright browser binaries/cache
+playwright/.cache/
+.playwright/
+
+# Data output
+data/*.csv
+data/*.parquet
+data/*.json
+!data/.gitkeep
