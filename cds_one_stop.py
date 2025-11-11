@@ -1,49 +1,30 @@
-# cds_one_stop.py
+#!/usr/bin/env python
 from __future__ import annotations
-import argparse, sys, logging, pathlib
-import pandas as pd
+import argparse, logging, sys, pathlib, pandas as pd
 from cds_helpers.clean_aggregate import build_series
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("CDS")
-
-def cmd_probe(args: argparse.Namespace) -> None:
-    print("OK: cds_one_stop is installed and importable.")
-
-def cmd_fetch(args: argparse.Namespace) -> None:
-    out = pathlib.Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df = build_series(
-        start=args.start, end=args.end,
-        entity=args.entity, currency=args.currency,
-        tenor_years=args.tenor_years, agg=args.agg
-    )
-    if df.empty:
-        LOG.warning("No rows aggregated between %s and %s for '%s'.", args.start, args.end, args.entity)
-        # still write a header-only CSV for determinism
-        df = pd.DataFrame(columns=["date", "value_bps", "count", "weight_sum"])
-    df.to_csv(out, index=False)
-    LOG.info("Wrote %s rows to %s", len(df), out)
+LOG = logging.getLogger("SBSR")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 def main(argv=None):
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--agg", choices=["weighted_mean","median","mean"], default="weighted_mean")
+    ap.add_argument("--out", required=True, help="Output CSV path")
+    args = ap.parse_args(argv)
 
-    s1 = sub.add_parser("probe")
-    s1.set_defaults(func=cmd_probe)
-
-    s2 = sub.add_parser("fetch")
-    s2.add_argument("--entity", required=True, help='e.g., "United States of America"')
-    s2.add_argument("--tenor-years", type=int, default=5)
-    s2.add_argument("--currency", default="USD")
-    s2.add_argument("--start", required=True)
-    s2.add_argument("--end", required=True)
-    s2.add_argument("--agg", default="weighted_mean", choices=["weighted_mean","median","mean"])
-    s2.add_argument("--out", required=True)
-    s2.set_defaults(func=cmd_fetch)
-
-    args = p.parse_args(argv)
-    args.func(args)
+    df = build_series(args.start, args.end, agg=args.agg)
+    if df.empty:
+        LOG.warning("No CDS data aggregated in the specified range.")
+    outp = pathlib.Path(args.out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(outp, index=False)
+    LOG.info("Wrote %s rows to %s", len(df), outp)
+    return 0
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))
