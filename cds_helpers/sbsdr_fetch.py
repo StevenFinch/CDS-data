@@ -14,6 +14,18 @@ SBSDR_BASE = (
     "sbs-transaction-csv?tradeDate={date}"
 )
 
+import datetime as dt
+from cds_helpers.net_resilient import get_url_resilient
+
+ICE_HOST = "regreporting.theice.com"
+ICE_URL_TMPL = "https://regreporting.theice.com/trade-reporting/api/v1/public-data/sbs-transaction-csv?tradeDate={d}"
+
+def fetch_sbsdr_day(date_str: str) -> str:
+    url = ICE_URL_TMPL.format(d=date_str)
+    # robust fetch: retries + DoH + --resolve fallback
+    return get_url_resilient(url, host=ICE_HOST, timeout=60, tries=4, backoff=1.6)
+
+
 def _safe_date(x):
     try:
         return dt.datetime.strptime(x.split("T")[0], "%Y-%m-%d").date()
