@@ -3,7 +3,7 @@ name: Backfill & Update CDS (2012 → 2024Q3)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 6 * * 1-5"  # 01:30 ET daily, adjust as you prefer
+    - cron: "30 6 * * 1-5"  # 01:30 ET weekdays
 
 permissions:
   contents: write
@@ -37,12 +37,12 @@ jobs:
         env:
           Y: ${{ matrix.year }}
         run: |
+          mkdir -p data/partial
           start="${Y}-01-01"
           end="${Y}-12-31"
-          # cap 2024 at Q3 if needed
           if [ "$Y" = "2024" ]; then end="2024-09-30"; fi
 
-          python cds_one_stop.py \
+          python cds_one_stop.py fetch \
             --entity "United States of America" \
             --tenor-years 5 \
             --currency USD \
@@ -75,23 +75,24 @@ jobs:
       - name: Merge CSVs (stable sort + de-dup)
         run: |
           python - <<'PY'
-          import pathlib, pandas as pd
-          p = pathlib.Path("data/partial")
-          files = sorted(p.glob("**/us_5y_cds_*.csv"))
+          import pathlib, pandas as pd, glob
+          outdir = pathlib.Path("data")
+          outdir.mkdir(parents=True, exist_ok=True)
+          files = glob.glob("data/partial/**/us_5y_cds_*.csv", recursive=True)
           if not files:
               raise SystemExit("No partials found")
           dfs = []
-          for f in files:
+          for f in sorted(files):
               try:
                   df = pd.read_csv(f)
               except Exception:
                   continue
               dfs.append(df)
-          out = pd.concat(dfs, ignore_index=True)
-          out = out.sort_values(["date"]).drop_duplicates(subset=["date"], keep="last")
-          pathlib.Path("data").mkdir(exist_ok=True, parents=True)
-          out.to_csv("data/us_5y_cds.csv", index=False)
-          print("Wrote data/us_5y_cds.csv", len(out))
+          all_ = pd.concat(dfs, ignore_index=True)
+          all_["date"] = pd.to_datetime(all_["date"]).dt.date
+          all_ = all_.sort_values(["date"]).drop_duplicates(subset=["date"], keep="last")
+          all_.to_csv("data/us_5y_cds.csv", index=False)
+          print("Wrote data/us_5y_cds.csv", len(all_))
           PY
 
       - name: Commit merged output
